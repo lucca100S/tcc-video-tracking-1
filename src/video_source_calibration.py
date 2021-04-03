@@ -31,7 +31,9 @@ class VideoSourceCalibration:
         red = (0, 0, 255)
         green = (0, 255, 0)
 
-        video_capture = cv2.VideoCapture(self.__video_source, cv2.CAP_DSHOW)
+        #Descomentar quando nao for utilizar o DroidCam
+        #video_capture = cv2.VideoCapture(self.__video_source, cv2.CAP_DSHOW)
+        video_capture = cv2.VideoCapture(self.__video_source)
 
         video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -68,7 +70,7 @@ class VideoSourceCalibration:
                     cv2.putText(frame, "Running, this may take a while ...", (0, 80),
                                 font, font_scale, green, 2, cv2.LINE_AA)
 
-            cv2.putText(frame, "Q - Quit ", (0, 700), font,
+            cv2.putText(frame, "Q - Quit ", (0, 105), font,
                         font_scale, green, 2, cv2.LINE_AA)
 
             cv2.imshow(win_name, frame)

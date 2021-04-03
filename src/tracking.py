@@ -8,6 +8,7 @@ import json
 import socket
 from multiprocessing import Process, Queue
 import time
+import math
 import numpy as np
 import cv2
 import cv2.aruco as aruco
@@ -27,16 +28,19 @@ class TrackingScheduler:
 
             tracking_config = TrackingCofig.persisted()
             queue = Queue(1)
+            filtered_queue = Queue(1)
 
             client_process = Process(target=DataPublishClientUDP(
                 server_ip=tracking_config.server_ip,
                 server_port=int(tracking_config.server_port),
-                queue=queue
+                queue=queue,
+                filtered_queue=filtered_queue
             ).listen)
             client_process.start()
 
             tracking_process = Process(target=Tracking(
                 queue=queue,
+                filtered_queue=filtered_queue,
                 device_number=tracking_config.device_number,
                 device_parameters_dir=tracking_config.device_parameters_dir,
                 show_video=tracking_config.show_video,
@@ -60,8 +64,9 @@ class TrackingScheduler:
 
 
 class Tracking:
-    def __init__(self, queue, device_number, device_parameters_dir, show_video, marker_detection_settings, translation_offset):
+    def __init__(self, queue, filtered_queue, device_number, device_parameters_dir, show_video, marker_detection_settings, translation_offset):
         self.__data_queue = queue
+        self.__filtered_data_queue = filtered_queue
         self.__device_number = device_number
         self.__device_parameters_dir = device_parameters_dir
         self.__show_video = show_video
@@ -69,28 +74,33 @@ class Tracking:
         self.__translation_offset = translation_offset
 
     def track(self):
+        #Descomentar quando nao for utilizar o DroidCam
+        #video_capture = cv2.VideoCapture(
+            #self.__device_number, cv2.CAP_DSHOW)
         video_capture = cv2.VideoCapture(
-            self.__device_number, cv2.CAP_DSHOW)
+            self.__device_number)
 
         video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
+        detection_result = {}
+        filtered_detection_result = {}
+        kalman_filter = create_kalman_filter(9, 3, 0.0334)
         while True:
             _, frame = video_capture.read()
 
-            detection_result = None
             if self.__marker_detection_settings.identifier == SINGLE_DETECTION:
-                detection_result = self.__single_marker_detection(frame, detection_result)
+                detection_result, filtered_detection_result = self.__single_marker_detection(frame, kalman_filter, filtered_detection_result)
             elif self.__marker_detection_settings.identifier == CUBE_DETECTION:
-                detection_result = self.__markers_cube_detection(frame, detection_result)
+                detection_result, filtered_detection_result = self.__markers_cube_detection(frame, kalman_filter, filtered_detection_result)
             else:
                 raise Exception("Invalid detection identifier. Received: {}".format(
                     self.__marker_detection_settings.identifier))
 
-            self.__publish_coordinates(json.dumps(detection_result))
+            self.__publish_coordinates(json.dumps(detection_result), json.dumps(filtered_detection_result))
 
             if self.__show_video:
-                self.__show_video_result(frame, detection_result)
+                self.__show_video_result(frame, filtered_detection_result)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -98,7 +108,7 @@ class Tracking:
         video_capture.release()
         cv2.destroyAllWindows()
 
-    def __single_marker_detection(self, frame, last_detection_result):
+    def __single_marker_detection(self, frame, filter, last_detection_result):
 
         corners, ids = self.__detect_markers(frame)
 
@@ -131,9 +141,9 @@ class Tracking:
                 aruco.drawAxis(frame, cam_mtx, dist,
                                marker_rvec, marker_tvec, 5)
 
-        return self.__detection_result(marker_rvec, marker_tvec, last_detection_result)
+        return self.__detection_result(marker_rvec, marker_tvec, filter, last_detection_result)
 
-    def __markers_cube_detection(self, frame, last_detection_result):
+    def __markers_cube_detection(self, frame, filter, last_detection_result):
         corners, ids = self.__detect_markers(frame)
 
         main_marker_rvec = None
@@ -167,7 +177,7 @@ class Tracking:
             aruco.drawAxis(frame, cam_mtx, dist,
                            main_marker_rvec, main_marker_tvec, 5)
 
-        return self.__detection_result(main_marker_rvec, main_marker_tvec, last_detection_result)
+        return self.__detection_result(main_marker_rvec, main_marker_tvec, filter, last_detection_result)
 
     def __detect_markers(self, frame):
         parameters = aruco.DetectorParameters_create()
@@ -218,18 +228,34 @@ class Tracking:
     def __apply_transformation(self, position_matrix, transformation):
         return np.dot(position_matrix, transformation)
 
-    def __detection_result(self, rvec, tvec, last_detection_result):
+    def __detection_result(self, rvec, tvec, filter, last_detection_result):
+        filtered_detection_result = {}
         detection_result = {}
 
-        detection_result['timestamp'] = time.time()
-        last_detection_result['timestamp'] = detection_result['timestamp']
+        filtered_detection_result['timestamp'] = time.time()
+        detection_result['timestamp'] = filtered_detection_result['timestamp']
+        last_detection_result['timestamp'] = filtered_detection_result['timestamp']
 
         success = rvec is not None and tvec is not None
+        filtered_detection_result['success'] = success
         detection_result['success'] = success
 
         if success:
             rot_mtx = np.zeros(shape=(3, 3))
             cv2.Rodrigues(rvec, rot_mtx)
+
+            filtered_detection_result['translation_x'] = tvec.item(0)
+            filtered_detection_result['translation_y'] = tvec.item(1)
+            filtered_detection_result['translation_z'] = tvec.item(2)
+            filtered_detection_result['rotation_right_x'] = rot_mtx.item(0, 0)
+            filtered_detection_result['rotation_right_y'] = rot_mtx.item(1, 0)
+            filtered_detection_result['rotation_right_z'] = rot_mtx.item(2, 0)
+            filtered_detection_result['rotation_up_x'] = rot_mtx.item(0, 1)
+            filtered_detection_result['rotation_up_y'] = rot_mtx.item(1, 1)
+            filtered_detection_result['rotation_up_z'] = rot_mtx.item(2, 1)
+            filtered_detection_result['rotation_forward_x'] = rot_mtx.item(0, 2)
+            filtered_detection_result['rotation_forward_y'] = rot_mtx.item(1, 2)
+            filtered_detection_result['rotation_forward_z'] = rot_mtx.item(2, 2)
 
             detection_result['translation_x'] = tvec.item(0)
             detection_result['translation_y'] = tvec.item(1)
@@ -244,23 +270,35 @@ class Tracking:
             detection_result['rotation_forward_y'] = rot_mtx.item(1, 2)
             detection_result['rotation_forward_z'] = rot_mtx.item(2, 2)
 
-            if last_detection_result != {} and last_detection_result.get("success"):
+            measurements = create_measurement_matrix(filtered_detection_result)
+            update_detection_result(filter, measurements, filtered_detection_result)
+
+            if last_detection_result.get('success', False):
+                detection_list = list(zip(filtered_detection_result.values(), last_detection_result.values()))
+                i = 5
                 oscillation = True
-                for value1, value2 in zip(detection_result.values(), last_detection_result.values()):
-                    if abs(value1 - value2) > 0.06:
+                while i < 14:
+                    if abs(detection_list[i][0] - detection_list[i][1]) > 0.01:
                         oscillation = False
                         break
-                
+                    i += 1
+
                 if oscillation:
-                    return last_detection_result
+                    self.__change_rot_mtx(filtered_detection_result, last_detection_result)
 
-        return detection_result
+        
+        return detection_result, filtered_detection_result
 
-    def __publish_coordinates(self, data):
+    def __publish_coordinates(self, data, filtered_data):
         if self.__data_queue.full():
             self.__data_queue.get()
 
         self.__data_queue.put(data)
+
+        #if self.__filtered_data_queue.full():
+        #    self.__filtered_data_queue.get()
+
+        #self.__filtered_data_queue.put(filtered_data)
 
     def __show_video_result(self, frame, detection_result):
         win_name = "Tracking"
@@ -279,7 +317,7 @@ class Tracking:
 
         if detection_result['success'] == 1:
             cv2.putText(frame, 'translation_x: {:.2f}'.format(detection_result['translation_x']), (0, 60),
-                        font, font_scale, font_color, 2, cv2.LINE_AA)
+                        font, font_scale, font_color, 2, cv2.LINE_AA)     
             cv2.putText(frame, 'translation_y: {:.2f}'.format(detection_result['translation_y']), (0, 80),
                         font, font_scale, font_color, 2, cv2.LINE_AA)
             cv2.putText(frame, 'translation_z: {:.2f}'.format(detection_result['translation_z']), (0, 100),
@@ -303,18 +341,29 @@ class Tracking:
             cv2.putText(frame, 'rotation_forward_z: {:.2f}'.format(detection_result['rotation_forward_z']), (0, 280),
                         font, font_scale, font_color, 2, cv2.LINE_AA)
 
-        cv2.putText(frame, "Q - Quit ", (0, 700), font,
+        cv2.putText(frame, "Q - Quit ", (0, 305), font,
                     font_scale, font_color, 2, cv2.LINE_AA)
 
         cv2.imshow(win_name, frame)
 
+    def __change_rot_mtx(self, filtered_detection_result, last_detection_result):
+        filtered_detection_result['rotation_right_x'] = last_detection_result['rotation_right_x']
+        filtered_detection_result['rotation_right_y'] = last_detection_result['rotation_right_y']
+        filtered_detection_result['rotation_right_z'] = last_detection_result['rotation_right_z']
+        filtered_detection_result['rotation_up_x'] = last_detection_result['rotation_up_x']
+        filtered_detection_result['rotation_up_y'] = last_detection_result['rotation_up_y']
+        filtered_detection_result['rotation_up_z'] = last_detection_result['rotation_up_z']
+        filtered_detection_result['rotation_forward_x'] = last_detection_result['rotation_forward_x']
+        filtered_detection_result['rotation_forward_y'] = last_detection_result['rotation_forward_y']
+        filtered_detection_result['rotation_forward_z'] = last_detection_result['rotation_forward_z']
 
 class DataPublishClientUDP:
 
-    def __init__(self, server_ip, server_port, queue):
+    def __init__(self, server_ip, server_port, queue, filtered_queue):
         self.server_ip = server_ip
         self.__server_port = server_port
         self.__queue = queue
+        self.__filtered_queue = filtered_queue
 
     def listen(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -322,6 +371,8 @@ class DataPublishClientUDP:
         while True:
             data = self.__queue.get()
             sock.sendto(data.encode(), (self.server_ip, self.__server_port))
+            #data = self.__filtered_queue.get()
+            #sock.sendto(data.encode(), (self.server_ip, self.__server_port))
 
 
 class TrackingCofig:
@@ -366,3 +417,80 @@ class TrackingCofig:
                 'server_port': self.server_port,
                 'marker_detection_settings': self.marker_detection_settings,
                 'translation_offset': self.translation_offset}, output, pickle.HIGHEST_PROTOCOL)
+
+def rotation_matrix_to_euler(R):
+    
+    sy = math.sqrt(R[0,0] * R[0,0] +  R[1,0] * R[1,0])
+    
+    singular = sy < 1e-6
+
+    if  not singular :
+        x = math.atan2(R[2,1] , R[2,2])
+        y = math.atan2(-R[2,0], sy)
+        z = math.atan2(R[1,0], R[0,0])
+    else :
+        x = math.atan2(-R[1,2], R[1,1])
+        y = math.atan2(-R[2,0], sy)
+        z = 0
+
+    return np.array([x, y, z])
+
+def euler_to_rotation_matrix(theta):
+    
+    R_x = np.array([[1,         0,                  0                   ],
+                    [0,         math.cos(theta[0]), -math.sin(theta[0]) ],
+                    [0,         math.sin(theta[0]), math.cos(theta[0])  ]])
+        
+    R_y = np.array([[math.cos(theta[1]),    0,      math.sin(theta[1])  ],
+                    [0,                     1,      0                   ],
+                    [-math.sin(theta[1]),   0,      math.cos(theta[1])  ]])
+                               
+    R_z = np.array([[math.cos(theta[2]),    -math.sin(theta[2]),    0],
+                    [math.sin(theta[2]),    math.cos(theta[2]),     0],
+                    [0,                     0,                      1]])
+                    
+    R = np.dot(R_z, np.dot(R_y, R_x ))
+
+    return R
+
+def create_kalman_filter(num_state, num_measurements, time):
+    kalman_filter = cv2.KalmanFilter(num_state, num_measurements, type=cv2.CV_64FC1)
+
+    kalman_filter.processNoiseCov = np.eye(num_state)*1e-5
+    kalman_filter.measurementNoiseCov = np.eye(num_measurements)*1e-4
+    kalman_filter.errorCovPost = np.eye(num_state)
+
+    kalman_filter.transitionMatrix = np.eye(num_state)
+    kalman_filter.transitionMatrix[0, 3] = time
+    kalman_filter.transitionMatrix[1, 4] = time
+    kalman_filter.transitionMatrix[2, 5] = time
+    kalman_filter.transitionMatrix[3, 6] = time
+    kalman_filter.transitionMatrix[4, 7] = time
+    kalman_filter.transitionMatrix[5, 8] = time
+    kalman_filter.transitionMatrix[0, 6] = 0.5 * time ** 2
+    kalman_filter.transitionMatrix[1, 7] = 0.5 * time ** 2
+    kalman_filter.transitionMatrix[2, 8] = 0.5 * time ** 2
+
+
+    kalman_filter.measurementMatrix = np.zeros((3, 9))
+    kalman_filter.measurementMatrix[0, 0] = 1
+    kalman_filter.measurementMatrix[1, 1] = 1
+    kalman_filter.measurementMatrix[2, 2] = 1
+    return kalman_filter
+
+def create_measurement_matrix(measurement):
+    measurements = np.zeros(3)
+    measurements[0] = measurement.get('translation_x')
+    measurements[1] = measurement.get('translation_y')
+    measurements[2] = measurement.get('translation_z')
+        
+    return measurements
+
+def update_detection_result(filter, measurements, detection_result):
+    filter.predict()
+    filter.correct(measurements)
+    
+    estimated_position = filter.statePost
+    detection_result['translation_x'] = float(estimated_position[0])
+    detection_result['translation_y'] = float(estimated_position[1])
+    detection_result['translation_z'] = float(estimated_position[2])
